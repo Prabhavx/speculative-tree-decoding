@@ -217,7 +217,7 @@ For toy distributions where exact $p$ and $q$ are known:
 
 With temperature=0, output must exactly match target model greedy decoding token-by-token.
 
-### Unit Tests (71 passing)
+### Unit Tests (78 passing)
 
 - Rejection sampling formula matches residual distribution
 - Tree attention mask includes exactly ancestors

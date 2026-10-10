@@ -1,16 +1,13 @@
 """Tree verification with target model and rejection sampling."""
 import torch
-import torch.nn.functional as F
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional
 from dataclasses import dataclass
-from .tree_builder import DraftTree, TreeNode
+from .tree_builder import DraftTree
 from .tree_attention import (
     flatten_tree_for_verification,
     build_tree_attention_mask,
-    build_tree_position_ids,
-    TreeAttentionMask,
 )
-from .tree_kv_cache import TreeKVCache, build_tree_position_ids as build_tree_pos_ids, build_tree_attention_mask as build_tree_attn_mask
+from .tree_kv_cache import TreeKVCache
 from .sampling import rejection_sample, greedy_rejection_sample, compute_logprobs, sample_from_logits
 
 
@@ -40,18 +37,13 @@ def build_tree_attention_mask_4d(
     
     # Build boolean mask first
     bool_mask = build_tree_attention_mask(prefix_length, parent_array, device)
-    bool_mask = bool_mask.unsqueeze(0)  # [1, total_len, total_len]
+    bool_mask = bool_mask.unsqueeze(0).expand(batch_size, -1, -1).clone()
     
     # If we have a prefix attention mask, incorporate it
     if attention_mask is not None:
-        # attention_mask is [batch, prefix_len], expand to [batch, total_len, total_len]
-        prefix_mask = torch.zeros((batch_size, total_len, total_len), dtype=torch.bool, device=device)
-        prefix_mask[:, :prefix_length, :prefix_length] = attention_mask.unsqueeze(1) & attention_mask.unsqueeze(2)
-        # Tree nodes attend to prefix based on attention_mask
-        for node_idx in range(num_nodes):
-            seq_idx = prefix_length + node_idx
-            prefix_mask[:, seq_idx, :prefix_length] = attention_mask.bool()
-        bool_mask = bool_mask & prefix_mask
+        prefix_keep = attention_mask.bool()
+        bool_mask[:, :, :prefix_length] &= prefix_keep.unsqueeze(1)
+        bool_mask[:, :prefix_length, :] &= prefix_keep.unsqueeze(2)
     
     # Convert to additive mask
     additive_mask = torch.zeros_like(bool_mask, dtype=dtype)
@@ -69,6 +61,121 @@ class TreeVerificationResult:
     target_logprobs: List[torch.Tensor] = None  # Target logprobs at each tree node
     target_tokens: List[int] = None  # Target's own predictions
     num_accepted: int = 0
+
+
+def _extract_tree_distributions(
+    outputs,
+    tree: DraftTree,
+    prefix_len: int,
+) -> Tuple[List[torch.Tensor], List[int], List[torch.Tensor], List[int]]:
+    """Extract per-node verification and next-token distributions."""
+    target_logprobs = []
+    target_tokens = []
+    next_logprobs = []
+    next_tokens = []
+
+    for node_idx, node in enumerate(tree.nodes):
+        verify_pos = prefix_len - 1 if node.parent_idx == -1 else prefix_len + node.parent_idx
+        if verify_pos < 0:
+            raise ValueError("Tree verification requires a non-empty prefix sequence")
+
+        verify_logits = outputs.logits[:, verify_pos, :]
+        verify_logprobs = compute_logprobs(verify_logits).squeeze(0)
+        target_logprobs.append(verify_logprobs)
+        target_tokens.append(verify_logits.argmax(dim=-1).item())
+
+        next_logits = outputs.logits[:, prefix_len + node_idx, :]
+        next_lp = compute_logprobs(next_logits).squeeze(0)
+        next_logprobs.append(next_lp)
+        next_tokens.append(next_logits.argmax(dim=-1).item())
+
+    return target_logprobs, target_tokens, next_logprobs, next_tokens
+
+
+def _select_tree_path(
+    tree: DraftTree,
+    target_logprobs: List[torch.Tensor],
+    target_tokens: List[int],
+    next_logprobs: List[torch.Tensor],
+    next_tokens: List[int],
+    temperature: float,
+    top_p: float,
+    top_k: int,
+) -> TreeVerificationResult:
+    """Apply rejection sampling along the accepted tree path."""
+    if tree.get_num_nodes() == 0:
+        return TreeVerificationResult(
+            accepted_tokens=[],
+            accepted_node_indices=[],
+            target_logprobs=target_logprobs,
+            target_tokens=target_tokens,
+            num_accepted=0,
+        )
+
+    accepted_node_indices = []
+    accepted_tokens = []
+    rejected_at = None
+    resampled_token = None
+
+    current_node_idx = 0
+
+    while True:
+        node = tree.nodes[current_node_idx]
+        draft_token = node.token_id
+        d_logprobs = node.logprobs
+        t_logprobs = target_logprobs[current_node_idx]
+
+        if temperature == 0.0:
+            accepted, resampled = greedy_rejection_sample(d_logprobs, t_logprobs, draft_token)
+        else:
+            accepted, resampled = rejection_sample(d_logprobs, t_logprobs, draft_token, temperature)
+
+        if accepted:
+            accepted_node_indices.append(current_node_idx)
+            accepted_tokens.append(draft_token)
+        else:
+            rejected_at = current_node_idx
+            resampled_token = resampled
+            break
+
+        if node.children:
+            target_token = next_tokens[current_node_idx]
+            matched_child = None
+            for child_idx in node.children:
+                if tree.nodes[child_idx].token_id == target_token:
+                    matched_child = child_idx
+                    break
+
+            if matched_child is not None:
+                current_node_idx = matched_child
+            else:
+                break
+        else:
+            break
+
+    if rejected_at is None and accepted_node_indices:
+        last_node_idx = accepted_node_indices[-1]
+        if temperature == 0.0:
+            bonus_token = next_tokens[last_node_idx]
+        else:
+            bonus_token = sample_from_logits(
+                next_logprobs[last_node_idx],
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+            ).item()
+        accepted_tokens.append(bonus_token)
+
+    output_count = len(accepted_tokens) + (1 if resampled_token is not None else 0)
+    return TreeVerificationResult(
+        accepted_tokens=accepted_tokens,
+        accepted_node_indices=accepted_node_indices,
+        rejected_at=rejected_at,
+        resampled_token=resampled_token,
+        target_logprobs=target_logprobs,
+        target_tokens=target_tokens,
+        num_accepted=output_count,
+    )
 
 
 def verify_tree(
@@ -102,6 +209,15 @@ def verify_tree(
     device = device or input_ids.device
     prefix_len = input_ids.size(1)
 
+    if tree.get_num_nodes() == 0:
+        return TreeVerificationResult(
+            accepted_tokens=[],
+            accepted_node_indices=[],
+            target_logprobs=[],
+            target_tokens=[],
+            num_accepted=0,
+        )
+
     # Flatten tree for verification
     flat_ids, tree_attn_mask, pos_ids = flatten_tree_for_verification(tree, input_ids)
 
@@ -109,7 +225,7 @@ def verify_tree(
     parent_array = tree.get_parent_array()
     if attention_mask is not None:
         full_mask = build_tree_attention_mask_4d(
-            parent_array, prefix_len, attention_mask, device, 
+            parent_array, prefix_len, attention_mask, device,
             dtype=next(target_model.parameters()).dtype
         )
     else:
@@ -132,96 +248,18 @@ def verify_tree(
             use_cache=True,
         )
 
-    # Extract target logprobs at each tree node position
-    target_logprobs = []
-    target_tokens = []
-
-    for node_idx in range(tree.get_num_nodes()):
-        seq_pos = prefix_len + node_idx
-        logits = outputs.logits[:, seq_pos - 1, :]
-        logprobs = compute_logprobs(logits).squeeze(0)
-        target_logprobs.append(logprobs)
-        target_tokens.append(logits.argmax(dim=-1).item())
-
-    # Perform rejection sampling along each branch
-    # We need to find the longest accepted path
-    accepted_node_indices = []
-    accepted_tokens = []
-    rejected_at = None
-    resampled_token = None
-
-    # Start from root, follow the path with highest acceptance
-    # For tree, we accept nodes along a single root-to-leaf path
-    # The path is determined by which child gets accepted at each branch point
-
-    current_node_idx = 0  # Root
-    path = [0]
-
-    while True:
-        node = tree.nodes[current_node_idx]
-        draft_token = node.token_id
-        d_logprobs = node.logprobs
-        t_logprobs = target_logprobs[current_node_idx]
-
-        if temperature == 0.0:
-            accepted, resampled = greedy_rejection_sample(d_logprobs, t_logprobs, draft_token)
-        else:
-            accepted, resampled = rejection_sample(d_logprobs, t_logprobs, draft_token, temperature)
-
-        if accepted:
-            accepted_node_indices.append(current_node_idx)
-            accepted_tokens.append(draft_token)
-        else:
-            rejected_at = current_node_idx
-            resampled_token = resampled
-            break
-
-        # If this node has children, pick the one that matches target's prediction
-        # (or sample from accepted children)
-        if node.children:
-            # Find which child the target model would predict
-            target_token = target_tokens[current_node_idx]
-            # Look for a child with matching token
-            matched_child = None
-            for child_idx in node.children:
-                if tree.nodes[child_idx].token_id == target_token:
-                    matched_child = child_idx
-                    break
-
-            if matched_child is not None:
-                current_node_idx = matched_child
-                path.append(current_node_idx)
-            else:
-                # No matching child - we can't continue this branch
-                # In standard tree spec decoding, we stop here
-                break
-        else:
-            # Leaf node, no more children
-            break
-
-    # Bonus token: if we accepted all nodes on the path, sample one extra target token.
-    if rejected_at is None and accepted_node_indices:
-        last_node_idx = accepted_node_indices[-1]
-        if temperature == 0.0:
-            bonus_token = target_tokens[last_node_idx]
-            accepted_tokens.append(bonus_token)
-        else:
-            bonus_token = sample_from_logits(
-                target_logprobs[last_node_idx],
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-            ).item()
-            accepted_tokens.append(bonus_token)
-
-    return TreeVerificationResult(
-        accepted_tokens=accepted_tokens,
-        accepted_node_indices=accepted_node_indices,
-        rejected_at=rejected_at,
-        resampled_token=resampled_token,
-        target_logprobs=target_logprobs,
-        target_tokens=target_tokens,
-        num_accepted=len(accepted_tokens),
+    target_logprobs, target_tokens, next_logprobs, next_tokens = _extract_tree_distributions(
+        outputs, tree, prefix_len
+    )
+    return _select_tree_path(
+        tree,
+        target_logprobs,
+        target_tokens,
+        next_logprobs,
+        next_tokens,
+        temperature,
+        top_p,
+        top_k,
     )
 
 
@@ -306,153 +344,17 @@ def verify_tree_with_kv_cache(
     2. Only computes tree nodes in single forward pass
     3. Supports rollback on rejection
     """
-    device = device or input_ids.device
-    prefix_len = input_ids.size(1)
-
-    # If cache doesn't match prefix, reset and recompute prefix
-    if target_cache.get_prefix_length() != prefix_len:
-        target_cache.reset()
-        target_cache.set_prefix(prefix_len)
-
-    num_nodes = tree.get_num_nodes()
-
-    # Prepare cache for tree verification
-    target_cache.prepare_for_tree_verification(num_nodes)
-
-    # Flatten tree for verification
-    flat_ids, tree_attn_mask, pos_ids = flatten_tree_for_verification(tree, input_ids)
-
-    # Build proper 4D additive attention mask for tree nodes only
-    parent_array = tree.get_parent_array()
-    tree_prefix_len = prefix_len
-    total_tree_len = num_nodes
-    
-    if attention_mask is not None:
-        # Build full mask for the whole sequence, then slice for tree portion
-        full_bool_mask = build_tree_attention_mask(tree_prefix_len, parent_array, device)
-        # We only need the tree portion of the mask (rows for tree nodes, cols for prefix + tree)
-        tree_bool_mask = full_bool_mask[tree_prefix_len:, :].unsqueeze(0)  # [1, num_nodes, total_len]
-        # Apply prefix attention mask
-        prefix_mask = attention_mask.bool().unsqueeze(1).expand(-1, num_nodes, -1)  # [batch, num_nodes, prefix_len]
-        tree_bool_mask[:, :, :tree_prefix_len] = tree_bool_mask[:, :, :tree_prefix_len] & prefix_mask
-        # Convert to additive mask
-        dtype = next(target_model.parameters()).dtype
-        additive_mask = torch.zeros_like(tree_bool_mask, dtype=dtype)
-        additive_mask.masked_fill_(~tree_bool_mask, torch.finfo(dtype).min)
-        tree_attn_mask_4d = additive_mask.unsqueeze(1)  # [batch, 1, num_nodes, total_len]
-    else:
-        # Build mask without prefix attention
-        bool_mask = build_tree_attention_mask(tree_prefix_len, parent_array, device)
-        tree_bool_mask = bool_mask[tree_prefix_len:, :].unsqueeze(0)  # [1, num_nodes, total_len]
-        dtype = next(target_model.parameters()).dtype
-        additive_mask = torch.zeros_like(tree_bool_mask, dtype=dtype)
-        additive_mask.masked_fill_(~tree_bool_mask, torch.finfo(dtype).min)
-        tree_attn_mask_4d = additive_mask.unsqueeze(1)  # [1, 1, num_nodes, total_len]
-
-    # Single forward pass with tree attention and KV cache
-    with torch.no_grad():
-        outputs = target_model(
-            input_ids=flat_ids[:, prefix_len:],  # Only tree nodes
-            attention_mask=tree_attn_mask_4d,
-            position_ids=pos_ids[:, prefix_len:],
-            past_key_values=target_cache.get_past_key_values(prefix_len),
-            use_cache=True,
-        )
-
-    # Update cache with new tree nodes
-    # Handle both DynamicCache and legacy tuple formats
-    past_kv = outputs.past_key_values
-    if hasattr(past_kv, 'layers'):
-        # DynamicCache format
-        layer_0 = past_kv.layers[0]
-        key_0, value_0 = layer_0.keys, layer_0.values
-    else:
-        # Legacy tuple format
-        key_0, value_0 = past_kv[0][0], past_kv[0][1]
-    target_cache.update_from_model_output(0, key_0, value_0, prefix_len)
-
-    # Extract target logprobs at each tree node position
-    target_logprobs = []
-    target_tokens = []
-
-    for node_idx in range(num_nodes):
-        logits = outputs.logits[:, node_idx, :]
-        logprobs = compute_logprobs(logits).squeeze(0)
-        target_logprobs.append(logprobs)
-        target_tokens.append(logits.argmax(dim=-1).item())
-
-    # Perform rejection sampling along the accepted path
-    accepted_node_indices = []
-    accepted_tokens = []
-    rejected_at = None
-    resampled_token = None
-
-    current_node_idx = 0  # Root
-
-    while True:
-        node = tree.nodes[current_node_idx]
-        draft_token = node.token_id
-        d_logprobs = node.logprobs
-        t_logprobs = target_logprobs[current_node_idx]
-
-        if temperature == 0.0:
-            accepted, resampled = greedy_rejection_sample(d_logprobs, t_logprobs, draft_token)
-        else:
-            accepted, resampled = rejection_sample(d_logprobs, t_logprobs, draft_token, temperature)
-
-        if accepted:
-            accepted_node_indices.append(current_node_idx)
-            accepted_tokens.append(draft_token)
-        else:
-            rejected_at = current_node_idx
-            resampled_token = resampled
-            break
-
-        # If this node has children, pick the one that matches target's prediction
-        if node.children:
-            target_token = target_tokens[current_node_idx]
-            matched_child = None
-            for child_idx in node.children:
-                if tree.nodes[child_idx].token_id == target_token:
-                    matched_child = child_idx
-                    break
-
-            if matched_child is not None:
-                current_node_idx = matched_child
-            else:
-                break
-        else:
-            break
-
-    # Handle rejection/acceptance for cache
-    if rejected_at is not None:
-        target_cache.reject_tree()
-    else:
-        target_cache.accept_tree_path(len(accepted_node_indices))
-
-    # Bonus token
-    if rejected_at is None and accepted_node_indices:
-        last_node_idx = accepted_node_indices[-1]
-        if temperature == 0.0:
-            bonus_token = target_tokens[last_node_idx]
-            accepted_tokens.append(bonus_token)
-        else:
-            # Sample bonus token from target distribution at temperature
-            bonus_logprobs = target_logprobs[last_node_idx]
-            bonus_token = sample_from_logits(
-                bonus_logprobs,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-            ).item()
-            accepted_tokens.append(bonus_token)
-
-    return TreeVerificationResult(
-        accepted_tokens=accepted_tokens,
-        accepted_node_indices=accepted_node_indices,
-        rejected_at=rejected_at,
-        resampled_token=resampled_token,
-        target_logprobs=target_logprobs,
-        target_tokens=target_tokens,
-        num_accepted=len(accepted_tokens),
+    result = verify_tree(
+        target_model,
+        tree,
+        input_ids,
+        attention_mask=attention_mask,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        device=device,
     )
+    # A flattened tree cache is not directly reusable as a linear accepted
+    # prefix when the accepted path skips siblings, so keep the state honest.
+    target_cache.reset()
+    return result

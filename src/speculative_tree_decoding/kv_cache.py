@@ -77,6 +77,27 @@ class KVCache:
             self.v_cache[layer_idx, :, :, :end_pos, :],
         )
 
+    def store_layer(
+        self,
+        layer_idx: int,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> int:
+        """
+        Replace a layer's cached key/value tensors with an exact model cache.
+
+        HuggingFace models return the full cache length for each layer. This
+        method writes that cache at position zero; callers set current_length
+        once after all layers have been stored.
+        """
+        seq_len = key.size(2)
+        if seq_len > self.max_length:
+            raise ValueError(f"Sequence length {seq_len} exceeds max_length {self.max_length}")
+
+        self.k_cache[layer_idx, :, :, :seq_len, :] = key
+        self.v_cache[layer_idx, :, :, :seq_len, :] = value
+        return seq_len
+
     def get(self, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """Get cached key/value up to current length."""
         return (
@@ -86,6 +107,8 @@ class KVCache:
 
     def set_length(self, length: int):
         """Set the current sequence length (for rollback on rejection)."""
+        if length < 0 or length > self.max_length:
+            raise ValueError(f"Invalid cache length {length}; max_length={self.max_length}")
         self.current_length = length
 
     def advance(self, steps: int):
@@ -171,6 +194,7 @@ class DraftKVCache:
             # Legacy tuple format
             layers = past_key_values
         
+        cache_length = 0
         for layer_idx, layer_kv in enumerate(layers):
             # Handle different formats: DynamicLayer (has .keys, .values), 
             # legacy tuple (k, v), or tuple with extra elements
@@ -181,7 +205,8 @@ class DraftKVCache:
                 k, v = layer_kv[0], layer_kv[1]
             else:
                 raise ValueError(f"Unknown past_key_values format at layer {layer_idx}: {type(layer_kv)}")
-            self.cache.update(layer_idx, k, v)
+            cache_length = max(cache_length, self.cache.store_layer(layer_idx, k, v))
+        self.cache.set_length(cache_length)
 
     def _get_past_key_values(self):
         """Retrieve past_key_values as DynamicCache for modern HF models."""
@@ -215,6 +240,7 @@ class TargetKVCache:
     ):
         self.cache = KVCache(config, batch_size, max_length, device, dtype)
         self.device = device
+        self.last_logits: Optional[torch.Tensor] = None
 
     def verify_chain(
         self,
@@ -230,10 +256,10 @@ class TargetKVCache:
             target_logprobs: Log probs at each draft position
             target_tokens: Target model's own predictions
         """
-        full_ids = torch.cat([
-            input_ids,
-            torch.tensor(draft_tokens, device=self.device).unsqueeze(0)
-        ], dim=1)
+        if not draft_tokens:
+            return [], []
+
+        draft_ids = torch.tensor(draft_tokens, device=self.device, dtype=torch.long).unsqueeze(0)
 
         if attention_mask is not None:
             full_mask = torch.cat([
@@ -245,32 +271,38 @@ class TargetKVCache:
 
         prefix_len = input_ids.size(1)
 
-        if self.cache.current_length == prefix_len:
+        if self.cache.current_length == prefix_len and self.last_logits is not None:
+            prefix_next_logits = self.last_logits
             outputs = model(
-                input_ids=full_ids[:, prefix_len:],
-                attention_mask=full_mask[:, prefix_len:] if full_mask is not None else None,
+                input_ids=draft_ids,
+                attention_mask=full_mask,
                 past_key_values=self._get_past_key_values(),
                 use_cache=True,
             )
+            distribution_logits = [prefix_next_logits]
+            distribution_logits.extend(outputs.logits[:, i, :] for i in range(len(draft_tokens)))
         else:
+            full_ids = torch.cat([input_ids, draft_ids], dim=1)
             outputs = model(
                 input_ids=full_ids,
                 attention_mask=full_mask,
                 use_cache=True,
             )
-            self._store_past_key_values(outputs.past_key_values)
+            distribution_logits = [
+                outputs.logits[:, prefix_len - 1 + i, :]
+                for i in range(len(draft_tokens) + 1)
+            ]
 
         target_logprobs = []
         target_tokens = []
 
-        for i in range(len(draft_tokens)):
-            pos = prefix_len + i
-            logits = outputs.logits[:, i, :]
+        for logits in distribution_logits:
             logprobs = torch.log_softmax(logits, dim=-1).squeeze(0)
             target_logprobs.append(logprobs)
             target_tokens.append(logits.argmax(dim=-1).item())
 
         self._store_past_key_values(outputs.past_key_values)
+        self.last_logits = distribution_logits[-1].detach()
         return target_logprobs, target_tokens
 
     def _store_past_key_values(self, past_key_values):
@@ -280,6 +312,7 @@ class TargetKVCache:
         else:
             layers = past_key_values
         
+        cache_length = 0
         for layer_idx, layer_kv in enumerate(layers):
             if hasattr(layer_kv, 'keys') and hasattr(layer_kv, 'values'):
                 k, v = layer_kv.keys, layer_kv.values
@@ -287,7 +320,8 @@ class TargetKVCache:
                 k, v = layer_kv[0], layer_kv[1]
             else:
                 raise ValueError(f"Unknown past_key_values format at layer {layer_idx}: {type(layer_kv)}")
-            self.cache.update(layer_idx, k, v)
+            cache_length = max(cache_length, self.cache.store_layer(layer_idx, k, v))
+        self.cache.set_length(cache_length)
 
     def _get_past_key_values(self):
         from transformers import DynamicCache
@@ -299,10 +333,16 @@ class TargetKVCache:
 
     def reset(self):
         self.cache.reset()
+        self.last_logits = None
 
-    def set_prefix_length(self, length: int):
+    def set_prefix_length(self, length: int, last_logits: Optional[torch.Tensor] = None):
         """Set cache length to prefix length (after accepting tokens)."""
+        old_length = self.cache.get_seq_length()
         self.cache.set_length(length)
+        if last_logits is not None:
+            self.last_logits = last_logits.detach()
+        elif length != old_length:
+            self.last_logits = None
 
     def get_length(self) -> int:
         return self.cache.get_seq_length()

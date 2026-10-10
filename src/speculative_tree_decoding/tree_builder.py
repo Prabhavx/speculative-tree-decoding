@@ -163,7 +163,7 @@ class StaticTreeBuilder:
                 with torch.no_grad():
                     outputs = draft_model(
                         input_ids=parent_ids[:, -1:],
-                        attention_mask=parent_mask[:, -1:] if parent_mask is not None else None,
+                        attention_mask=parent_mask,
                         past_key_values=parent_kv,
                         use_cache=True,
                     )
@@ -197,7 +197,7 @@ class StaticTreeBuilder:
                 with torch.no_grad():
                     outputs = draft_model(
                         input_ids=parent_ids[:, -1:],
-                        attention_mask=parent_mask[:, -1:] if parent_mask is not None else None,
+                        attention_mask=parent_mask,
                         past_key_values=parent_kv,
                         use_cache=True,
                     )

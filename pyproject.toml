@@ -39,6 +39,9 @@ demo = [
     "plotly>=5.20.0",
 ]
 
+[project.scripts]
+speculative-tree-decode = "speculative_tree_decoding.cli:main"
+
 [tool.setuptools.package-dir]
 "" = "src"
 

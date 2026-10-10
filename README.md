@@ -19,7 +19,7 @@ draft model explores multiple possible continuations at once.
 | Adaptive draft trees | Entropy-based branching that changes width based on draft confidence. |
 | Tree attention masks | Masks that let each tree node attend only to the prompt and its ancestors. |
 | Tree-aware KV cache | Experimental cache manager with prefix sharing and rollback hooks. |
-| Correctness tests | 72 tests covering rejection sampling, tree masks, caches, and toy-distribution equivalence. |
+| Correctness tests | 78 tests covering rejection sampling, tree masks, caches, engine regressions, and toy-distribution equivalence. |
 | Benchmarks and demo | A benchmark runner plus a Streamlit UI for interactive experimentation. |
 
 ## Project status
@@ -110,6 +110,24 @@ tree_engine = DynamicTreeSpeculativeDecodingEngine(
 
 print(tree_engine.generate("Write a short poem about GPUs:", max_new_tokens=80))
 ```
+
+## Command line usage
+
+After installing the package, you can generate from the terminal:
+
+```bash
+speculative-tree-decode \
+  --engine chain \
+  --draft Qwen/Qwen2.5-0.5B-Instruct \
+  --target Qwen/Qwen2.5-1.5B-Instruct \
+  --prompt "Explain speculative decoding simply:" \
+  --max-new-tokens 80 \
+  --device auto \
+  --show-timing
+```
+
+Available engines are `autoregressive`, `chain`, `static-tree`, `dynamic-tree`,
+and `adaptive-tree`.
 
 ## Run the demo
 

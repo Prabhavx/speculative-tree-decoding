@@ -1,12 +1,10 @@
 """Core speculative decoding engine: chain-based and tree-based drafting with rejection sampling."""
 import torch
-import torch.nn.functional as F
-from transformers import AutoTokenizer
 from typing import List, Tuple, Optional
 import logging
 
 from .kv_cache import DraftKVCache, TargetKVCache
-from .tree_builder import StaticTreeBuilder, DraftTree
+from .tree_builder import StaticTreeBuilder
 from .dynamic_tree_builder import DynamicTreeBuilder, AdaptiveTreeBuilder
 from .tree_kv_cache import TreeKVCache
 from .verify import (
@@ -24,6 +22,34 @@ from .sampling import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _trim_at_stop(tokens: List[int], stop_tokens: List[int]) -> List[int]:
+    """Return tokens up to and including the first stop token."""
+    for idx, token in enumerate(tokens):
+        if token in stop_tokens:
+            return tokens[: idx + 1]
+    return tokens
+
+
+@torch.no_grad()
+def _sample_target_next_token(
+    target_model,
+    input_ids: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    temperature: float,
+    top_p: float,
+    top_k: int,
+) -> int:
+    """Sample one fallback token from the target model."""
+    outputs = target_model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+    next_logits = outputs.logits[:, -1, :]
+    return sample_from_logits(
+        next_logits.squeeze(0),
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+    ).item()
 
 
 class SpeculativeDecodingEngine:
@@ -90,31 +116,19 @@ class SpeculativeDecodingEngine:
         draft_tokens = []
         draft_logprobs = []
 
-        prefix_len = input_ids.size(1)
+        if gamma <= 0:
+            return draft_tokens, draft_logprobs
 
-        if self.draft_cache.get_length() != prefix_len:
-            self.draft_cache.reset()
-            outputs = self.draft_model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                use_cache=True,
-            )
-            self.draft_cache._store_past_key_values(outputs.past_key_values)
+        outputs = self.draft_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=True,
+        )
+        past_key_values = outputs.past_key_values
+        next_logits = outputs.logits[:, -1, :]
+        current_attention_mask = attention_mask.clone() if attention_mask is not None else None
 
-        for _ in range(gamma):
-            last_token = input_ids[:, -1:]
-            last_mask = attention_mask[:, -1:] if attention_mask is not None else None
-
-            outputs = self.draft_model(
-                input_ids=last_token,
-                attention_mask=last_mask,
-                past_key_values=self.draft_cache._get_past_key_values(),
-                use_cache=True,
-            )
-
-            self.draft_cache._store_past_key_values(outputs.past_key_values)
-
-            next_logits = outputs.logits[:, -1, :]
+        for step in range(gamma):
             next_logprobs = compute_logprobs(next_logits)
 
             next_token = sample_from_logits(
@@ -127,9 +141,27 @@ class SpeculativeDecodingEngine:
             draft_tokens.append(next_token.item())
             draft_logprobs.append(next_logprobs.squeeze(0))
 
-            input_ids = torch.cat([input_ids, next_token.unsqueeze(0).unsqueeze(0)], dim=1)
-            if attention_mask is not None:
-                attention_mask = torch.cat([attention_mask, torch.ones_like(attention_mask[:, :1])], dim=1)
+            if step == gamma - 1:
+                break
+
+            next_input = next_token.reshape(1, 1)
+            if current_attention_mask is not None:
+                current_attention_mask = torch.cat(
+                    [current_attention_mask, torch.ones_like(current_attention_mask[:, :1])],
+                    dim=1,
+                )
+
+            outputs = self.draft_model(
+                input_ids=next_input,
+                attention_mask=current_attention_mask,
+                past_key_values=past_key_values,
+                use_cache=True,
+            )
+            past_key_values = outputs.past_key_values
+            next_logits = outputs.logits[:, -1, :]
+
+        if past_key_values is not None:
+            self.draft_cache._store_past_key_values(past_key_values)
 
         return draft_tokens, draft_logprobs
 
@@ -192,7 +224,10 @@ class SpeculativeDecodingEngine:
                 input_ids, draft_tokens, attention_mask
             )
 
+            step_tokens: List[int] = []
             accepted_count = 0
+            rejected = False
+            bonus_added = False
             for i, (draft_token, d_logprobs, t_logprobs) in enumerate(
                 zip(draft_tokens, draft_logprobs, target_logprobs)
             ):
@@ -202,44 +237,54 @@ class SpeculativeDecodingEngine:
                     accepted, resampled = rejection_sample(d_logprobs, t_logprobs, draft_token, self.temperature)
 
                 if accepted:
-                    generated_tokens.append(draft_token)
+                    step_tokens.append(draft_token)
                     accepted_count += 1
                 else:
-                    generated_tokens.append(resampled)
+                    step_tokens.append(resampled)
+                    rejected = True
                     break
 
-            if accepted_count == len(draft_tokens):
-                bonus_token = target_tokens[-1]
+            if (
+                accepted_count == len(draft_tokens)
+                and total_generated + len(step_tokens) < max_new_tokens
+            ):
+                bonus_idx = len(draft_tokens)
                 if self.temperature == 0.0:
-                    generated_tokens.append(bonus_token)
-                    accepted_count += 1
+                    bonus_token = target_tokens[bonus_idx]
+                    step_tokens.append(bonus_token)
+                    bonus_added = True
                 else:
-                    # Sample bonus token from target distribution at temperature
                     bonus_token = sample_from_logits(
-                        target_logprobs[-1],
+                        target_logprobs[bonus_idx],
                         temperature=self.temperature,
                         top_p=self.top_p,
                         top_k=self.top_k,
                     ).item()
-                    generated_tokens.append(bonus_token)
-                    accepted_count += 1
+                    step_tokens.append(bonus_token)
+                    bonus_added = True
 
-            # Fix: track actual tokens added to sequence (accepted + resampled)
-            # When accepted_count == 0, we still added 1 resampled token
-            tokens_added = accepted_count if accepted_count > 0 else 1
-            new_tokens = generated_tokens[-tokens_added:]
-            new_ids = torch.tensor(new_tokens, device=self.device, dtype=torch.long).unsqueeze(0)
+            step_tokens = _trim_at_stop(step_tokens, stop_tokens)
+
+            tokens_added = len(step_tokens)
+            if tokens_added == 0:
+                break
+
+            generated_tokens.extend(step_tokens)
+            new_ids = torch.tensor(step_tokens, device=self.device, dtype=torch.long).unsqueeze(0)
             input_ids = torch.cat([input_ids, new_ids], dim=1)
             attention_mask = torch.cat([
                 attention_mask,
                 torch.ones(1, tokens_added, device=self.device, dtype=attention_mask.dtype)
             ], dim=1)
 
-            self.target_cache.set_prefix_length(input_ids.size(1))
+            if rejected or bonus_added or tokens_added != len(draft_tokens):
+                self.target_cache.reset()
+            else:
+                self.target_cache.set_prefix_length(input_ids.size(1))
 
             total_generated += tokens_added
 
-            if any(tok in stop_tokens for tok in new_tokens):
+            if any(tok in stop_tokens for tok in step_tokens):
                 break
 
         return self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
@@ -369,6 +414,7 @@ class TreeSpeculativeDecodingEngine:
         total_generated = 0
 
         while total_generated < max_new_tokens:
+            remaining = max_new_tokens - total_generated
             # Build draft tree
             tree = self.tree_builder.build_tree(
                 self.draft_model, input_ids, attention_mask, self.device
@@ -391,12 +437,20 @@ class TreeSpeculativeDecodingEngine:
             num_accepted = len(accepted_tokens)
 
             if num_accepted == 0:
-                # Fallback: use target model's top prediction
-                with torch.no_grad():
-                    outputs = self.target_model(input_ids=input_ids, attention_mask=attention_mask)
-                    next_token = outputs.logits[:, -1, :].argmax(dim=-1).item()
+                next_token = _sample_target_next_token(
+                    self.target_model,
+                    input_ids,
+                    attention_mask,
+                    self.temperature,
+                    self.top_p,
+                    self.top_k,
+                )
                 accepted_tokens = [next_token]
-                num_accepted = 1
+
+            accepted_tokens = _trim_at_stop(accepted_tokens[:remaining], stop_tokens)
+            num_accepted = len(accepted_tokens)
+            if num_accepted == 0:
+                break
 
             generated_tokens.extend(accepted_tokens)
 
@@ -408,6 +462,7 @@ class TreeSpeculativeDecodingEngine:
                 torch.ones(1, num_accepted, device=self.device, dtype=attention_mask.dtype)
             ], dim=1)
 
+            self.target_cache.reset()
             total_generated += num_accepted
 
             if any(tok in stop_tokens for tok in accepted_tokens):
@@ -500,6 +555,7 @@ class DynamicTreeSpeculativeDecodingEngine:
         total_generated = 0
 
         while total_generated < max_new_tokens:
+            remaining = max_new_tokens - total_generated
             # Build adaptive draft tree
             tree = self.tree_builder.build_tree(
                 self.draft_model, input_ids, attention_mask, self.device
@@ -522,11 +578,20 @@ class DynamicTreeSpeculativeDecodingEngine:
             num_accepted = len(accepted_tokens)
 
             if num_accepted == 0:
-                with torch.no_grad():
-                    outputs = self.target_model(input_ids=input_ids, attention_mask=attention_mask)
-                    next_token = outputs.logits[:, -1, :].argmax(dim=-1).item()
+                next_token = _sample_target_next_token(
+                    self.target_model,
+                    input_ids,
+                    attention_mask,
+                    self.temperature,
+                    self.top_p,
+                    self.top_k,
+                )
                 accepted_tokens = [next_token]
-                num_accepted = 1
+
+            accepted_tokens = _trim_at_stop(accepted_tokens[:remaining], stop_tokens)
+            num_accepted = len(accepted_tokens)
+            if num_accepted == 0:
+                break
 
             generated_tokens.extend(accepted_tokens)
 
@@ -537,6 +602,7 @@ class DynamicTreeSpeculativeDecodingEngine:
                 torch.ones(1, num_accepted, device=self.device, dtype=attention_mask.dtype)
             ], dim=1)
 
+            self.target_cache.reset()
             total_generated += num_accepted
 
             if any(tok in stop_tokens for tok in accepted_tokens):
@@ -622,6 +688,7 @@ class AdaptiveTreeSpeculativeDecodingEngine:
         total_generated = 0
 
         while total_generated < max_new_tokens:
+            remaining = max_new_tokens - total_generated
             tree = self.tree_builder.build_tree(
                 self.draft_model, input_ids, attention_mask, self.device
             )
@@ -641,11 +708,20 @@ class AdaptiveTreeSpeculativeDecodingEngine:
             num_accepted = len(accepted_tokens)
 
             if num_accepted == 0:
-                with torch.no_grad():
-                    outputs = self.target_model(input_ids=input_ids, attention_mask=attention_mask)
-                    next_token = outputs.logits[:, -1, :].argmax(dim=-1).item()
+                next_token = _sample_target_next_token(
+                    self.target_model,
+                    input_ids,
+                    attention_mask,
+                    self.temperature,
+                    self.top_p,
+                    self.top_k,
+                )
                 accepted_tokens = [next_token]
-                num_accepted = 1
+
+            accepted_tokens = _trim_at_stop(accepted_tokens[:remaining], stop_tokens)
+            num_accepted = len(accepted_tokens)
+            if num_accepted == 0:
+                break
 
             generated_tokens.extend(accepted_tokens)
 
@@ -656,6 +732,7 @@ class AdaptiveTreeSpeculativeDecodingEngine:
                 torch.ones(1, num_accepted, device=self.device, dtype=attention_mask.dtype)
             ], dim=1)
 
+            self.target_cache.reset()
             total_generated += num_accepted
 
             if any(tok in stop_tokens for tok in accepted_tokens):
